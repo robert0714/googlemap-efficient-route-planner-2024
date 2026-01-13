@@ -6,10 +6,15 @@ import com.google.maps.routing.v2.ComputeRoutesResponse;
 import com.google.maps.routing.v2.Location;
 import com.google.maps.routing.v2.Route;
 import com.google.maps.routing.v2.RouteLeg;
-import com.google.maps.routing.v2.RouteLegStep; 
+import com.google.maps.routing.v2.RouteLegStep;
+import com.google.maps.routing.v2.RouteLegStepTransitDetails;
 import com.google.maps.routing.v2.RouteTravelMode;
 import com.google.maps.routing.v2.RoutesClient;
-import com.google.maps.routing.v2.RoutesSettings; 
+import com.google.maps.routing.v2.RoutesSettings;
+import com.google.maps.routing.v2.TransitLine;
+import com.google.maps.routing.v2.TransitPreferences;
+import com.google.maps.routing.v2.TransitPreferences.TransitRoutingPreference;
+import com.google.maps.routing.v2.TransitPreferences.TransitTravelMode;
 import com.google.maps.routing.v2.Units;
 import com.google.maps.routing.v2.Waypoint;
 import com.google.type.LatLng;
@@ -17,12 +22,13 @@ import com.google.type.Money;
 import com.google.api.gax.core.NoCredentialsProvider;
 import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
 import java.io.IOException;
-
+import java.net.URI;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.commons.lang3.StringUtils;
- 
+import org.springframework.web.util.UriComponentsBuilder;
+
 import java.util.Comparator;
 import java.util.HashMap;
 
@@ -117,13 +123,13 @@ public class ComputeRoutesClient implements AutoCloseable{
     /**
      * 建立 Waypoint
      */
-    protected Waypoint createWaypoint(String addr) {
+    public Waypoint createWaypoint(String addr) {
         return Waypoint.newBuilder()
         		.setAddress(addr)                
                 .build();
     }
     
-    protected com.google.maps.routing.v2.Route chooseShortestRoute(final java.util.List<com.google.maps.routing.v2.Route> routes) {
+    public com.google.maps.routing.v2.Route chooseShortestRoute(final java.util.List<com.google.maps.routing.v2.Route> routes) {
 		return routes.stream()
 			.min(Comparator.comparingLong(this::computeTotalDistance))
 			.orElse(routes.get(0));
@@ -153,7 +159,7 @@ public class ComputeRoutesClient implements AutoCloseable{
             Money transitFare = route.getTravelAdvisory().getTransitFare();
 			if (transitFare != null) {
 				
-				log.info("大眾交通運輸費用>> units: %s ,currencyCode:  %s".formatted(transitFare.getUnits() ,transitFare.getCurrencyCode()));
+				log.info("transitFare units: %s ,currencyCode:  %s".formatted(transitFare.getUnits() ,transitFare.getCurrencyCode()));
 			}
             for (RouteLeg leg : legs) {
                 log.info("--- 路段 (Leg) 資訊 ---");
@@ -188,6 +194,12 @@ public class ComputeRoutesClient implements AutoCloseable{
 //                    log.info("  [Step %d] TripShortText: %s".formatted(j + 1,TripShortText));
                     log.info("  [Step %d] %s (距離: %d m, 時間: %d 秒)"
                         .formatted(j + 1, instruction.replace(System.lineSeparator(), "").replace("\n", "").replace("\r", ""), stepDistance, stepSeconds));
+                    if (step.hasTransitDetails()) {
+                    	RouteLegStepTransitDetails td = step.getTransitDetails();
+//                    	System.out.println(td.getLocalizedValues().toString());
+                    	parseTransitDetails(td);
+                    	
+                    }
                 }
             }
             
@@ -196,6 +208,26 @@ public class ComputeRoutesClient implements AutoCloseable{
             log.info("==================================");
         }
     }
+    protected void parseTransitDetails(RouteLegStepTransitDetails details) {
+        // 1. 取得路線資訊
+        TransitLine line = details.getTransitLine();
+        String displayName = line.getNameShort(); // 例如 "307" 或 "BL"
+        String type = line.getVehicle().getType().toString(); //如 BUS, SUBWAY
+        // 2. 取得發車細節
+        String depTime = details.getLocalizedValues().getDepartureTime().toString();
+        String depStop = details.getStopDetails().getDepartureStop().getName();
+        
+        // 3. 取得行進方向 (Headsign)
+        String headsign = details.getHeadsign(); // 例如 "往 台北車站"
+        
+        // 4. 取得總共經過幾站
+        int stopCount = details.getStopCount();
+        
+        // 將以上資訊組合推播至 UI
+        log.info("   [運具 %s %s 往%s] (發車時間: %s , 停%d站 , 沿途停靠: %s )"
+                .formatted(type, displayName , headsign ,depTime , stopCount, depStop)  );
+    }
+    
     /**
      * 解析回應
      */
@@ -244,8 +276,11 @@ public class ComputeRoutesClient implements AutoCloseable{
                 .setComputeAlternativeRoutes(true)//要求要有替代路線
 //                .addRequestedReferenceRoutes(ReferenceRoute.SHORTER_DISTANCE) //要求範例：距離較短的路線   INVALID_ARGUMENT: A SHORTER_DISTANCE ReferenceRoute may not be requested when optimize_waypoint_order is set.      
                 .setTravelMode(TRAVEL_MODE)
-//                .setTransitPreferences(TransitPreferences.newBuilder().build())
-//                .setRoutingPreference(RoutingPreference.TRAFFIC_AWARE)
+                .setTransitPreferences(TransitPreferences.newBuilder()
+                		.addAllowedTravelModes(TransitTravelMode.TRAIN)
+                		.setRoutingPreference(TransitRoutingPreference.LESS_WALKING )
+                		.build()) 
+//                .addRequestedReferenceRoutes(ReferenceRoute.SHORTER_DISTANCE)
                 .setLanguageCode("zh-TW")
                 .setUnits(Units.METRIC);
         
@@ -290,6 +325,45 @@ public class ComputeRoutesClient implements AutoCloseable{
         url.append("&key=").append(this.apikey);
         
         return url.toString();
+    }
+    /**
+     * 生成 Static Map URL(Get Method/有資安疑慮，key顯示在get URL，僅能最為測試使用)
+     */
+    public URI generateStaticMapUrlV2(
+            String encodedPolyline,
+            double originLat, double originLng,
+            double destLat, double destLng,
+            int width, int height,
+            String language) {
+        
+        StringBuilder url = new StringBuilder(STATIC_MAP_BASE_URL);
+        url.append("?size=").append(width).append("x").append(height);
+        url.append("&path=color:0x0000ff|weight:5|enc:").append(encodedPolyline);
+        
+        // 起點標記
+        url.append("&markers=color:red|label:A|")
+           .append(originLat).append(",").append(originLng);
+        
+        // 終點標記
+        url.append("&markers=color:red|label:B|")
+           .append(destLat).append(",").append(destLng);
+        
+        // language
+        url.append("&language=").append(language);
+        
+        // API KEY
+        url.append("&key=").append(this.apikey);
+        
+        URI targetUri = UriComponentsBuilder.fromHttpUrl(STATIC_MAP_BASE_URL)
+                .queryParam("size", "%dx%d".formatted(width ,height ))
+                .queryParam("path", "color:0x0000ff|weight:5|enc:"+encodedPolyline) // 自動處理特殊字元
+                .queryParam("markers", "color:red|label:A|%f,%f".formatted(originLat ,originLng))
+                .queryParam("markers", "color:red|label:B|%f,%f".formatted(destLat ,destLng))
+                .queryParam("language", language)
+                .queryParam("key", this.apikey)
+                .build()
+                .toUri();
+        return targetUri;
     }
     /**
      * 路線結果類別
